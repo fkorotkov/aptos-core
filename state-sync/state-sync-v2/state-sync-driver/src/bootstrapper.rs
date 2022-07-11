@@ -227,7 +227,6 @@ impl VerifiedEpochStates {
     }
 }
 
-// TODO(joshlind): persist the index (e.g., in case we crash mid-download)?
 /// A simple container to manage data related to state value snapshot syncing
 struct StateValueSyncer {
     // Whether or not a state snapshot receiver has been initialized
@@ -238,10 +237,6 @@ struct StateValueSyncer {
 
     // The epoch ending ledger info for the version we're syncing
     ledger_info_to_sync: Option<LedgerInfoWithSignatures>,
-
-    // The next state value index to commit (all state values before this have been
-    // committed).
-    next_state_index_to_commit: u64,
 
     // The next state value index to process (all state values before this have been
     // processed -- i.e., sent to the storage synchronizer).
@@ -257,16 +252,14 @@ impl StateValueSyncer {
             initialized_state_snapshot_receiver: false,
             is_sync_complete: false,
             ledger_info_to_sync: None,
-            next_state_index_to_commit: 0,
             next_state_index_to_process: 0,
             transaction_output_to_sync: None,
         }
     }
 
-    /// Resets all speculative state related to state value syncing (i.e., all
-    /// speculative data that has not been successfully committed to storage)
-    pub fn reset_speculative_state(&mut self) {
-        self.next_state_index_to_process = self.next_state_index_to_commit
+    /// Updates the next state index to process
+    pub fn update_next_state_index_to_process(&mut self, next_state_index_to_process: u64) {
+        self.next_state_index_to_process = next_state_index_to_process;
     }
 }
 
@@ -546,9 +539,10 @@ impl<
             self.state_value_syncer.ledger_info_to_sync = Some(highest_known_ledger_info.clone());
         }
 
-        // Fetch the transaction info first, before the states
+        // Fetch the data that we're missing
         let highest_known_ledger_version = highest_known_ledger_info.ledger_info().version();
         let data_stream = if self.state_value_syncer.transaction_output_to_sync.is_none() {
+            // Fetch the transaction info first, before the states
             self.streaming_client
                 .get_all_transaction_outputs(
                     highest_known_ledger_version,
@@ -557,9 +551,26 @@ impl<
                 )
                 .await?
         } else {
-            let start_index = Some(self.state_value_syncer.next_state_index_to_commit);
+            // Get the number of state keys and values already persisted to storage
+            // for the target version and identify if we've already synced
+            let num_state_values_persisted = self
+                .storage
+                .get_num_saved_state_values(highest_known_ledger_version)
+                .map_err(|error| {
+                    Error::StorageError(format!(
+                        "Failed to get the number of saved state values from storage: {:?}",
+                        error
+                    ))
+                })? as u64;
+            self.state_value_syncer
+                .update_next_state_index_to_process(num_state_values_persisted);
+
+            // Fetch the missing state keys
             self.streaming_client
-                .get_all_state_values(highest_known_ledger_version, start_index)
+                .get_all_state_values(
+                    highest_known_ledger_version,
+                    Some(next_state_index_to_process),
+                )
                 .await?
         };
         self.active_data_stream = Some(data_stream);
@@ -647,7 +658,7 @@ impl<
                     Error::IntegerOverflow("The highest local epoch end has overflown!".into())
                 })?
         } else {
-            unreachable!("Genesis should always end epoch 0!");
+            unreachable!("Genesis should always end the first epoch!");
         };
 
         // Compare the highest local epoch end to the highest advertised epoch end
@@ -1239,34 +1250,6 @@ impl<
             notification_feedback,
         )
         .await
-    }
-
-    /// Handles a notification from the driver that new state values have been
-    /// committed to storage.
-    pub fn handle_committed_state_values(
-        &mut self,
-        committed_states: CommittedStates,
-    ) -> Result<(), Error> {
-        // Update the last committed state value index
-        self.state_value_syncer.next_state_index_to_commit = committed_states
-            .last_committed_state_index
-            .checked_add(1)
-            .ok_or_else(|| {
-                Error::IntegerOverflow("The next state value index to commit has overflown!".into())
-            })?;
-
-        // Check if we've downloaded all state values
-        if committed_states.all_states_synced {
-            info!(LogSchema::new(LogEntry::Bootstrapper).message(&format!(
-                "Successfully synced all state values at version: {:?}. \
-                Last committed index: {:?}",
-                self.state_value_syncer.ledger_info_to_sync,
-                committed_states.last_committed_state_index
-            )));
-            self.state_value_syncer.is_sync_complete = true;
-        }
-
-        Ok(())
     }
 
     /// Returns the speculative stream state. Assumes that the state exists.
