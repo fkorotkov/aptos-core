@@ -36,22 +36,17 @@ impl DBPruner for StateStorePruner {
         STATE_STORE_PRUNER_NAME
     }
 
-    fn prune(&self, _ledger_db_batch: &mut SchemaBatch, max_versions: u64) -> Result<Version> {
+    fn prune(&self, _ledger_db_batch: &mut SchemaBatch, _max_versions: u64) -> Result<Version> {
         if !self.is_pruning_pending() {
             return Ok(self.min_readable_version());
         }
         let min_readable_version = self.min_readable_version.load(Ordering::Relaxed);
-        let target_version = self.target_version();
-        return match prune_state_store(
-            &self.db,
-            min_readable_version,
-            target_version,
-            max_versions as usize,
-        ) {
-            Ok(new_min_readable_version) => {
+        //let target_version = self.target_version();
+        return match prune_state_store(&self.db, min_readable_version, 0) {
+            Ok((new_min_readable_version, next_item_stale_since_version)) => {
                 self.record_progress(new_min_readable_version);
                 // Try to purge the log.
-                if let Err(e) = self.maybe_purge_index() {
+                if let Err(e) = self.maybe_purge_index(next_item_stale_since_version) {
                     warn!(
                         error = ?e,
                         "Failed purging state node index, ignored.",
@@ -122,11 +117,24 @@ impl StateStorePruner {
     ///
     /// We issue (range) deletes on the index only periodically instead of after every pruning batch
     /// to avoid sending too many deletions to the DB, which takes disk space and slows it down.
-    fn maybe_purge_index(&self) -> Result<()> {
+    fn maybe_purge_index(
+        &self,
+        next_item_stale_since_version_option: Option<Version>,
+    ) -> Result<()> {
         const MIN_INTERVAL: Duration = Duration::from_secs(10);
         const MIN_VERSIONS: u64 = 60000;
 
         let min_readable_version = self.min_readable_version.load(Ordering::Relaxed);
+
+        // Check if the next item in the index has the same `stale_since_version` as the
+        // `current min_readable version`. If yes, the index at `min_readable_version` cannot
+        // be pruned. If the `next_item_stale_since_version_option` is none. The index does not have
+        // more items so we can prune the index at `min_readable_version`.
+        if let Some(next_item_stale_since_version) = next_item_stale_since_version_option {
+            if next_item_stale_since_version == min_readable_version {
+                return Ok(());
+            }
+        }
         let max_index_purged_version = self.max_index_purged_version.load(Ordering::Relaxed);
 
         // A deletion is issued at most once in one minute and when the pruner has progressed by at
@@ -149,27 +157,21 @@ impl StateStorePruner {
         }
         Ok(())
     }
-
-    pub fn target_version(&self) -> Version {
-        self.target_version.load(Ordering::Relaxed)
-    }
 }
 
 pub fn prune_state_store(
     db: &DB,
     min_readable_version: Version,
-    target_version: Version,
-    max_versions: usize,
-) -> Result<Version> {
-    let indices = StaleNodeIndicesByVersionIterator::new(db, min_readable_version, target_version)?
-        .take(max_versions) // Iterator<Item = Result<Vec<StaleNodeIndex>>>
-        .collect::<Result<Vec<_>>>()? // now Vec<Vec<StaleNodeIndex>>
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+    _max_versions: usize,
+) -> anyhow::Result<(Version, Option<Version>)> {
+    let batch_size = 1;
+    let indices_iter =
+        StaleNodeIndicesByNumberOfItemsIterator::new(db, min_readable_version, batch_size)?;
+    let next_item_stale_since_version = indices_iter.next_item_stale_since_version;
+    let indices = indices_iter.collect::<anyhow::Result<Vec<_>>>()?;
 
     if indices.is_empty() {
-        Ok(min_readable_version)
+        Ok((min_readable_version, next_item_stale_since_version))
     } else {
         let _timer = OTHER_TIMERS_SECONDS
             .with_label_values(&["pruner_commit"])
@@ -180,59 +182,52 @@ pub fn prune_state_store(
             .into_iter()
             .try_for_each(|index| batch.delete::<JellyfishMerkleNodeSchema>(&index.node_key))?;
         db.write_schemas(batch)?;
-        Ok(new_min_readable_version)
+        Ok((new_min_readable_version, next_item_stale_since_version))
     }
 }
 
-struct StaleNodeIndicesByVersionIterator<'a> {
+struct StaleNodeIndicesByNumberOfItemsIterator<'a> {
     inner: Peekable<SchemaIterator<'a, StaleNodeIndexSchema>>,
-    target_min_readable_version: Version,
+    num_items: usize,
+    next_item_stale_since_version: Option<Version>,
+    start_pruning_version: Version,
 }
 
-impl<'a> StaleNodeIndicesByVersionIterator<'a> {
-    fn new(
-        db: &'a DB,
-        min_readable_version: Version,
-        target_min_readable_version: Version,
-    ) -> Result<Self> {
+impl<'a> StaleNodeIndicesByNumberOfItemsIterator<'a> {
+    fn new(db: &'a DB, start_pruning_version: Version, num_items: usize) -> anyhow::Result<Self> {
         let mut iter = db.iter::<StaleNodeIndexSchema>(ReadOptions::default())?;
-        iter.seek(&min_readable_version)?;
+        iter.seek(&start_pruning_version)?;
 
         Ok(Self {
             inner: iter.peekable(),
-            target_min_readable_version,
+            num_items,
+            next_item_stale_since_version: None,
+            start_pruning_version,
         })
     }
 
-    fn next_result(&mut self) -> Result<Option<Vec<StaleNodeIndex>>> {
+    fn next_result(&mut self) -> Result<Option<StaleNodeIndex>> {
+        if self.num_items == 0 {
+            return Ok(None);
+        }
         match self.inner.next().transpose()? {
             None => Ok(None),
             Some((index, _)) => {
-                let version = index.stale_since_version;
-                if version > self.target_min_readable_version {
-                    return Ok(None);
-                }
-
-                let mut indices = vec![index];
-                while let Some(res) = self.inner.peek() {
-                    if let Ok((index_ref, _)) = res {
-                        if index_ref.stale_since_version != version {
-                            break;
-                        }
+                self.num_items -= 1;
+                // Check the next item to determine the `next_item_stale_since_version`
+                if let Some(res) = self.inner.peek() {
+                    if let Ok((next_index_ref, _)) = res {
+                        self.next_item_stale_since_version = Some(next_index_ref.stale_since_version);
                     }
-
-                    let (index, _) = self.inner.next().transpose()?.expect("Should be Some.");
-                    indices.push(index);
                 }
-
-                Ok(Some(indices))
+                return Ok(Some(index));
             }
         }
     }
 }
 
-impl<'a> Iterator for StaleNodeIndicesByVersionIterator<'a> {
-    type Item = Result<Vec<StaleNodeIndex>>;
+impl<'a> Iterator for StaleNodeIndicesByNumberOfItemsIterator<'a> {
+    type Item = anyhow::Result<StaleNodeIndex>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next_result().transpose()

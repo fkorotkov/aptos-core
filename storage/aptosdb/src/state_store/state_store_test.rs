@@ -45,13 +45,12 @@ fn put_value_set(
 fn prune_stale_indices(
     store: &StateStore,
     min_readable_version: Version,
-    target_min_readable_version: Version,
+    version_being_pruned: Version,
     limit: usize,
 ) {
     pruner::state_store::prune_state_store(
         &store.state_merkle_db,
         min_readable_version,
-        target_min_readable_version,
         limit,
     )
     .unwrap();
@@ -289,7 +288,7 @@ fn test_retired_records() {
     {
         prune_stale_indices(
             store, 0, /* min_readable_version */
-            1, /* target_min_readable_version */
+            0, /* version_being_pruned */
             0, /* limit */
         );
         verify_value_and_proof(store, key1.clone(), Some(&value1), 0, root0);
@@ -298,7 +297,7 @@ fn test_retired_records() {
     {
         prune_stale_indices(
             store, 0,   /* min_readable_version */
-            1,   /* target_min_readable_version */
+            0,   /* target_min_readable_version */
             100, /* limit */
         );
         // root0 is gone.
