@@ -10,6 +10,6 @@ task:
     - docker buildx use --default multibuilder
     - docker buildx inspect --bootstrap
   builder_script: 
-    - docker buildx bake --set *.platform=linux/amd64,linux/arm64 --file docker/docker-bake-rust-all.hcl builder
+    - docker buildx bake --set *.platform=linux/amd64,linux/arm64 --file docker/docker-bake-rust-all.hcl builder --load
   all_script: 
-    - docker buildx bake --set *.platform=linux/amd64,linux/arm64 --file docker/docker-bake-rust-all.hcl all
+    - docker buildx bake --set *.platform=linux/amd64,linux/arm64 --file docker/docker-bake-rust-all.hcl all --load
