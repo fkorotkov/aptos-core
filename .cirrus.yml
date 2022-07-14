@@ -1,0 +1,15 @@
+task:
+  name: Build Docker Images (multi-arch)
+  compute_engine_instance:
+    image_project: cirrus-images
+    image: family/docker-builder
+    cpu: 8
+    memory: 24G
+  setup_script:
+    - docker buildx create --name multibuilder
+    - docker buildx use --default multibuilder
+    - docker buildx inspect --bootstrap
+  builder_script: 
+    - docker buildx bake --platform linux/amd64,linux/arm64 --file docker/docker-bake-rust-all.hcl builder
+  all_script: 
+    - docker buildx bake --platform linux/amd64,linux/arm64 --file docker/docker-bake-rust-all.hcl all
